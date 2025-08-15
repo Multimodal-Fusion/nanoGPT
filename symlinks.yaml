@@ -4,6 +4,7 @@
 # Uncomment the folders you want to symlink
 
 symlinks:
+  - out: out
   - data: data
   # - data: data
   # - checkpoints: checkpoints
