@@ -4,6 +4,7 @@
 # Uncomment the folders you want to symlink
 
 symlinks:
+  - wandb: wandb
   - out: out
   - data: data
   # - data: data
