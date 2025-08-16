@@ -11,7 +11,8 @@ wandb_run_name='gpt2-124M-bz60-gradacc8-v1'
 batch_size = 12
 block_size = 1024
 gradient_accumulation_steps = 5*8#5 * 8
-n_embd = 768 * 4
+n_embd = 768
+num_per_token_registers = 3
 
 # this makes total number of tokens be 300B
 max_iters = 600000

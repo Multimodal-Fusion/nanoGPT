@@ -15,6 +15,16 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Flex Attention (PyTorch 2.5+). We’ll fallback if not available.
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    _HAS_FLEX = True
+except Exception:
+    _HAS_FLEX = False
+    # raise an error if flex attention is not available
+    if not _HAS_FLEX:
+        raise ImportError("Flex Attention is not available. Please install PyTorch 2.5 or higher.")
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -41,6 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.config = config
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -48,6 +59,57 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        # per token registers
+        self.num_per_token_registers = getattr(config, "num_per_token_registers", 0)
+        if self.num_per_token_registers > 0:
+            self.block_mask = self.create_flex_attn_mask()
+
+    def create_flex_attn_mask(self):
+        """
+        One-time FlexAttention BlockMask for STRIDED registers.
+
+        Layout:
+        t = config.block_size  (real tokens)
+        r = num_per_token_registers
+        reals:      [0 .. t-1]
+        registers:  [t .. t + r*t - 1]
+        reg(u,i) = t + u*t + i
+
+        Allowed attention:
+        - real i -> reals k<=i  OR registers of token i
+        - reg(i) -> parent real i OR registers of token i
+
+        Built with (B=1, H=n_head) and broadcast across actual batch.
+        Assumes you use full fixed length T = t*(1+r) at runtime.
+        """
+        # of real tokens; registers occupy [t .. t + r*t - 1]
+        # mask_mod returns True to KEEP (q,k) pair, False to mask it out
+        # Layout reminders:
+        #   - real i: index i
+        #   - register u of token i: index t + u*t + i
+        #   - registers span [t .. t + r*t - 1]
+        r = self.num_per_token_registers
+        assert r > 0, "Registers disabled; no need for Flex block mask."
+        t = self.config.block_size
+        T_total = t * (1 + self.num_per_token_registers)
+        # mask_mod(q_idx, k_idx) => True to KEEP (q,k), False to drop
+        def mask_mod(b, h, q_idx, kv_idx):
+            # identify real/register rows/cols
+            is_real_q  = q_idx < t
+            is_real_k  = kv_idx < t
+            k_in_regs  = (kv_idx >= t) & (kv_idx < t + r * t)
+            # parent token index of q (works for both real and register q)
+            parent_i = torch.where(is_real_q, q_idx, (q_idx - t) % t)
+            # kv is a register of parent_i  <=>  kv in regs AND (kv - t - parent_i) % t == 0
+            same_token_reg = k_in_regs & (((kv_idx - t - parent_i) % t) == 0)
+            # permissions
+            allow_real_q_real_k = is_real_q & is_real_k & (kv_idx <= q_idx)   # causal among reals
+            allow_real_q_regs   = is_real_q & same_token_reg                  # real -> its registers
+            allow_reg_q_parent  = (~is_real_q) & (kv_idx == parent_i)         # register -> parent real
+            allow_reg_q_regs    = (~is_real_q) & same_token_reg               # register -> its registers
+            return allow_real_q_real_k | allow_real_q_regs | allow_reg_q_parent | allow_reg_q_regs
+        block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T_total, KV_LEN=T_total)  # BLOCK_SIZE default is fine
+        return block_mask
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -61,7 +123,13 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            if self.num_per_token_registers == 0:
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                # we need to use flex attention with a mask such that each normal token has normal causal attention mask + it pays attention to token registers corresponding to only that token
+                # for each token register, it pays attention to the original token and the token registers corresponding to that token
+                # so we need to create a mask that is (T + num_per_token_registers, T + num_per_token_registers)
+                y = flex_attention(q, k, v, block_mask=self.block_mask.to(q.device))
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -114,6 +182,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    num_per_token_registers: int = 3 # per token additional register tokens
 
 class GPT(nn.Module):
 
@@ -143,6 +212,12 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+        # init per token registers
+        self.num_per_token_registers = config.num_per_token_registers
+        if self.num_per_token_registers > 0:
+            self.per_token_registers = nn.Parameter(torch.zeros(config.num_per_token_registers, config.n_embd))
+            torch.nn.init.normal_(self.per_token_registers, mean=0.0, std=0.02) # initialize with a normal distribution
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -177,10 +252,28 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        # add per token registers
+        if self.num_per_token_registers > 0:
+            # for each token, add the per token registers right after than token
+            # so in total, we have (b, t * (1 + self.num_per_token_registers), n_embd)
+            # so to do this, we first repeat the token register embeddings (num_per_token_registers, n_embd) -> (b, num_per_token_registers, n_embd)
+            per_token_registers = self.per_token_registers.unsqueeze(0).expand(b, -1, -1)
+            # then also for each token we need to have a register token so (b, num_per_token_registers, n_embd) to (b, t, num_per_token_registers, n_embd)
+            per_token_registers = per_token_registers.repeat_interleave(t, dim=1)
+            # the we add it to the sequence dimension (b, t * (1 + num_per_token_registers), n_embd)
+            x = torch.cat([x, per_token_registers], dim=1) # (b, t * (1 + num_per_token_registers), n_embd)
+
+        # forward the transformer blocks
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
 
+        # remove per token registers
+        if self.num_per_token_registers > 0:
+            x = x[:, :t, :] # (b, t * (1 + num_per_token_registers), n_embd) -> (b, t, n_embd)
+
+        # apply layer norm and lm head
+        x = self.transformer.ln_f(x)
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
