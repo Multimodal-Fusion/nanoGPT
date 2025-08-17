@@ -25,6 +25,10 @@ except Exception:
     if not _HAS_FLEX:
         raise ImportError("Flex Attention is not available. Please install PyTorch 2.5 or higher.")
 
+# compile flex attention and create block mask
+flex_attention = torch.compile(flex_attention)
+create_block_mask = torch.compile(create_block_mask)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -63,6 +67,12 @@ class CausalSelfAttention(nn.Module):
         self.num_per_token_registers = getattr(config, "num_per_token_registers", 0)
         if self.num_per_token_registers > 0:
             self.block_mask = self.create_flex_attn_mask()
+            # import cv2
+            # import imageio
+            # import numpy as np
+            # mask = cv2.resize(self.block_mask[0, 0].cpu().float().numpy(), (1024, 1024))
+            # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
+            # print(self.block_mask)
 
     def create_flex_attn_mask(self):
         """
@@ -108,7 +118,7 @@ class CausalSelfAttention(nn.Module):
             allow_reg_q_parent  = (~is_real_q) & (kv_idx == parent_i)         # register -> parent real
             allow_reg_q_regs    = (~is_real_q) & same_token_reg               # register -> its registers
             return allow_real_q_real_k | allow_real_q_regs | allow_reg_q_parent | allow_reg_q_regs
-        block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T_total, KV_LEN=T_total)  # BLOCK_SIZE default is fine
+        block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T_total, KV_LEN=T_total, _compile=True)  # BLOCK_SIZE default is fine
         return block_mask
 
     def forward(self, x):
