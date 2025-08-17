@@ -102,8 +102,9 @@ class CausalSelfAttention(nn.Module):
         assert r > 0, "Registers disabled; no need for Flex block mask."
         t = self.config.block_size
         T_total = t * (1 + self.num_per_token_registers)
+
         # mask_mod(q_idx, k_idx) => True to KEEP (q,k), False to drop
-        def mask_mod(b, h, q_idx, kv_idx):
+        def mask_mod_old(b, h, q_idx, kv_idx):
             # identify real/register rows/cols
             is_real_q  = q_idx < t
             is_real_k  = kv_idx < t
@@ -118,6 +119,35 @@ class CausalSelfAttention(nn.Module):
             allow_reg_q_parent  = (~is_real_q) & (kv_idx == parent_i)         # register -> parent real
             allow_reg_q_regs    = (~is_real_q) & same_token_reg               # register -> its registers
             return allow_real_q_real_k | allow_real_q_regs | allow_reg_q_parent | allow_reg_q_regs
+        
+        # modified mask fn to allow registers to also attend to causal history of real tokens up to parent_i
+        def mask_mod(q_idx, kv_idx, t, r):
+            is_real_q  = q_idx < t
+            is_real_k  = kv_idx < t
+            k_in_regs  = (kv_idx >= t) & (kv_idx < t + r * t)
+
+            # parent index of q (works for real and register q)
+            parent_i = torch.where(is_real_q, q_idx, (q_idx - t) % t)
+
+            # registers that belong to the same parent token
+            same_token_reg = k_in_regs & (((kv_idx - t - parent_i) % t) == 0)
+
+            # existing permissions
+            allow_real_q_real_k = is_real_q & is_real_k & (kv_idx <= q_idx)   # causal among reals
+            allow_real_q_regs   = is_real_q & same_token_reg                  # real -> its registers
+            allow_reg_q_parent  = (~is_real_q) & (kv_idx == parent_i)         # register -> parent real
+            allow_reg_q_regs    = (~is_real_q) & same_token_reg               # register -> its registers
+
+            # NEW: register q can attend to causal history of real tokens up to parent_i
+            allow_reg_q_real_hist = (~is_real_q) & is_real_k & (kv_idx <= parent_i)
+
+            return (
+                allow_real_q_real_k
+                | allow_real_q_regs
+                | allow_reg_q_parent
+                | allow_reg_q_regs
+                | allow_reg_q_real_hist
+            )
         block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T_total, KV_LEN=T_total, _compile=True)  # BLOCK_SIZE default is fine
         return block_mask
 
