@@ -43,3 +43,15 @@ mask = mask.numpy()
 # save the mask as a png image
 plt.imshow(mask)
 plt.savefig('mask.png')
+
+
+print(block_mask)
+import imageio
+import numpy as np
+from torch.nn.attention.flex_attention import create_mask
+
+mask = create_mask(attention_mask, B=None, H=None, Q_LEN=total_length +
+                    padded_length, KV_LEN=total_length + padded_length, device=device)
+import cv2
+mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
+imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))

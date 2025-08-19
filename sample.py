@@ -79,7 +79,8 @@ if start.startswith('FILE:'):
         start = f.read()
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-
+print (x.shape)
+print (x)
 # run generation
 with torch.no_grad():
     with ctx:

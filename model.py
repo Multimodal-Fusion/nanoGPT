@@ -66,7 +66,8 @@ class CausalSelfAttention(nn.Module):
         # per token registers
         self.num_per_token_registers = getattr(config, "num_per_token_registers", 0)
         if self.num_per_token_registers > 0:
-            self.block_mask = self.create_flex_attn_mask()
+            self.block_mask_cache = {} # cache block masks for each sequence length
+            self.block_mask_cache[self.config.block_size] = self.create_flex_attn_mask(seq_len=self.config.block_size)
             # import cv2
             # import imageio
             # import numpy as np
@@ -74,7 +75,7 @@ class CausalSelfAttention(nn.Module):
             # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
             # print(self.block_mask)
 
-    def create_flex_attn_mask(self):
+    def create_flex_attn_mask(self, seq_len=None):
         """
         One-time FlexAttention BlockMask for STRIDED registers.
 
@@ -100,7 +101,7 @@ class CausalSelfAttention(nn.Module):
         #   - registers span [t .. t + r*t - 1]
         r = self.num_per_token_registers
         assert r > 0, "Registers disabled; no need for Flex block mask."
-        t = self.config.block_size
+        t = self.config.block_size if seq_len is None else seq_len // (1 + self.num_per_token_registers)
         T_total = t * (1 + self.num_per_token_registers)
 
         # mask_mod(q_idx, k_idx) => True to KEEP (q,k), False to drop
@@ -169,7 +170,9 @@ class CausalSelfAttention(nn.Module):
                 # we need to use flex attention with a mask such that each normal token has normal causal attention mask + it pays attention to token registers corresponding to only that token
                 # for each token register, it pays attention to the original token and the token registers corresponding to that token
                 # so we need to create a mask that is (T + num_per_token_registers, T + num_per_token_registers)
-                y = flex_attention(q, k, v, block_mask=self.block_mask.to(q.device))
+                if T not in self.block_mask_cache:
+                    self.block_mask_cache[T] = self.create_flex_attn_mask(seq_len=T)
+                y = flex_attention(q, k, v, block_mask=self.block_mask_cache[T].to(q.device))
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
